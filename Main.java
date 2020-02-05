@@ -5,12 +5,77 @@ import java.util.HashMap;
 import java.util.Iterator;
 
 
-interface ComponentType {
-    int getId();
-    Class getType();
+abstract class ComponentType {
+    public static final int MAX_ID = 255;
 
-    default boolean isMarker() {
-        return getType() == null;
+    public final int id;
+    public final Class type;
+    public final boolean isMarker;
+
+    private static final HashMap<Integer, ComponentType> registry = new HashMap<>();
+
+    ComponentType(int id, Class type) {
+        if (id < 0) {
+            throw new IllegalArgumentException("ComponentType ID must be positive integer.");
+        }
+        if (id > MAX_ID) {
+            throw new IllegalArgumentException("ComponentType ID is too high. Support more bit flags in Archetype to support higher IDs.");
+        }
+        if (type == null) {
+            throw new IllegalArgumentException("type is null");
+        }
+        
+        this.id = id;
+        this.type = type;
+        isMarker = type == Void.class;
+
+        synchronized (registry) {
+            if (registry.containsKey(id)) {
+                throw new RuntimeException("ComponentType ID already registered: " + id);
+            }
+            registry.put(id, this);
+        }
+    }
+}
+
+final class MarkerComponent extends ComponentType {
+    public MarkerComponent(int id) {
+        super(id, Void.class);
+    }
+}
+final class ByteComponent extends ComponentType {
+    public ByteComponent(int id) {
+        super(id, byte.class);
+    }
+}
+final class ShortComponent extends ComponentType {
+    public ShortComponent(int id) {
+        super(id, short.class);
+    }
+}
+final class IntComponent extends ComponentType {
+    public IntComponent(int id) {
+        super(id, int.class);
+    }
+}
+final class LongComponent extends ComponentType {
+    public LongComponent(int id) {
+        super(id, long.class);
+    }
+}
+final class FloatComponent extends ComponentType {
+    public FloatComponent(int id) {
+        super(id, float.class);
+    }
+}
+final class DoubleComponent extends ComponentType {
+    public DoubleComponent(int id) {
+        super(id, double.class);
+    }
+}
+final class Component<T> extends ComponentType {
+    public Component(int id, Class<T> type) {
+        super(id, type);
     }
 }
 
@@ -28,17 +93,11 @@ final class Util {
 
 
 final class Archetype implements Iterable<ComponentType> {
-    static final int MAX_ID_COUNT = 4096;
-    static final int MAX_COMPONENT_TYPES = 256;
-
     public final int id;
     public final Key key;
 
     private final long tag;
-    private final long flags0;
-    private final long flags1;
-    private final long flags2;
-    private final long flags3;
+    private final long flags0, flags1, flags2, flags3;
     private final ComponentType[] components;
     private final byte[] indexes;
 
@@ -46,9 +105,6 @@ final class Archetype implements Iterable<ComponentType> {
     private static int counter;
 
     private Archetype(int id, Key key, ComponentType[] components) {
-        if (id >= MAX_ID_COUNT) {
-            throw new RuntimeException("too many archetypes");
-        }
         if (components.length > 128) {
             throw new RuntimeException("too many components in archetype");
         }
@@ -60,12 +116,12 @@ final class Archetype implements Iterable<ComponentType> {
         this.flags2 = key.flags2;
         this.flags3 = key.flags3;
         this.components = components;
-        indexes = new byte[MAX_COMPONENT_TYPES];
-        for (int i = 0; i < MAX_COMPONENT_TYPES; ++i) {
+        indexes = new byte[ComponentType.MAX_ID + 1];
+        for (int i = 0; i <= ComponentType.MAX_ID; ++i) {
             indexes[i] = -1;
         }
         for (int i = 0; i < components.length; ++i) {
-            indexes[components[i].getId()] = (byte) i;
+            indexes[components[i].id] = (byte) i;
         }
     }
 
@@ -81,41 +137,40 @@ final class Archetype implements Iterable<ComponentType> {
     }
 
     public static Archetype of(long tag, ComponentType... components) {
-        long flags0 = 0;
-        long flags1 = 0;
-        long flags2 = 0;
-        long flags3 = 0;
+        components = normalize(components);
+        long flags0 = 0, flags1 = 0, flags2 = 0, flags3 = 0;
         for (ComponentType c : components) {
-            int id = c.getId();
+            int id = c.id;
             if (id < 64) {
-                long flag = 1L << id;
-                if ((flags0 & flag) != 0) {
-                    throw new RuntimeException("same ComponentType specified twice");
-                }
-                flags0 |= flag;
+                flags0 |= 1L << id;
             } else if (id < 128) {
-                long flag = 1L << (id - 64);
-                if ((flags1 & flag) != 0) {
-                    throw new RuntimeException("same ComponentType specified twice");
-                }
-                flags1 |= flag;
+                flags1 |= 1L << (id - 64);
             } else if (id < 192) {
-                long flag = 1L << (id - 128);
-                if ((flags2 & flag) != 0) {
-                    throw new RuntimeException("same ComponentType specified twice");
-                }
-                flags2 |= flag;
+                flags2 |= 1L << (id - 128);
             } else if (id < 256) {
-                long flag = 1L << (id - 192);
-                if ((flags3 & flag) != 0) {
-                    throw new RuntimeException("same ComponentType specified twice");
-                }
-                flags3 |= flag;
+                flags3 |= 1L << (id - 192);
             } else {
-                throw new UnsupportedOperationException("ComponentType ID too high. Extend Archetype with new flags member");
+                throw new UnsupportedOperationException("should not happen");
             }
         }
         return getOrCreate(new Key(tag, flags0, flags1, flags2, flags3), components);
+    }
+
+    private static ComponentType[] normalize(ComponentType[] components) {
+        Arrays.sort(components, (a, b) -> {
+            return a.id - b.id;
+        });
+        int out = 0;
+        for (int inp = 1; inp < components.length; ++inp) {
+            if (components[inp].id != components[out].id) {
+                components[++out] = components[inp];
+            }
+        }
+        int newLength = out + 1;
+        if (newLength == components.length) {
+            return components;
+        }
+        return Arrays.copyOf(components, newLength);
     }
 
     public static Archetype of(ComponentType... components) {
@@ -151,7 +206,7 @@ final class Archetype implements Iterable<ComponentType> {
         for (ComponentType c : this.components) {
             boolean remove = false;
             for (ComponentType c2 : components) {
-                if (c.getId() == c2.getId()) {
+                if (c.id == c2.id) {
                     remove = true;
                     break;
                 }
@@ -167,11 +222,11 @@ final class Archetype implements Iterable<ComponentType> {
     }
 
     public int indexOf(ComponentType c) {
-        return indexes[c.getId()];
+        return indexes[c.id];
     }
 
     public boolean hasComponent(ComponentType c) {
-        int id = c.getId();
+        int id = c.id;
         if (id < 64) {
             return (flags0 & (1L << id)) != 0;
         } else if (id < 128) {
@@ -181,7 +236,7 @@ final class Archetype implements Iterable<ComponentType> {
         } else if (id < 256) {
             return (flags3 & (1L << (id - 192))) != 0;
         } else {
-            throw new UnsupportedOperationException("ComponentType ID too high. Extend Archetype with new flags member");
+            return false;
         }
     }
 
@@ -218,10 +273,7 @@ final class Archetype implements Iterable<ComponentType> {
 
     public static final class Key {
         private final long tag;
-        private final long flags0;
-        private final long flags1;
-        private final long flags2;
-        private final long flags3;
+        private final long flags0, flags1, flags2, flags3;
         private final int hash;
 
         private Key(long tag, long flags0, long flags1, long flags2, long flags3) {
@@ -274,14 +326,12 @@ final class EntityChunk {
         handles = new long[capacity];
         buffers = new Object[archetype.size()];
         for (int i = 0; i < archetype.size(); ++i) {
-            buffers[i] = Array.newInstance(archetype.get(i).getType(), capacity);
+            buffers[i] = Array.newInstance(archetype.get(i).type, capacity);
         }
         count = 0;
     }
 
-    public Archetype getArchetype() {
-        return archetype;
-    }
+    public Archetype getArchetype() { return archetype; }
 
     void setArchetype(Archetype newArchetype) {
         Object[] newBuffers = new Object[newArchetype.size()];
@@ -290,22 +340,18 @@ final class EntityChunk {
             if (archetype.hasComponent(c)) {
                 newBuffers[i] = buffers[archetype.indexOf(c)];
             } else {
-                newBuffers[i] = Array.newInstance(c.getType(), handles.length);
+                newBuffers[i] = Array.newInstance(c.type, handles.length);
             }
         }
         archetype = newArchetype;
         buffers = newBuffers;
     }
 
-    public long getHandle(int i) {
-        return handles[i];
-    }
-
     void grow() {
         int newCapacity = handles.length * 2;
         handles = Arrays.copyOf(handles, newCapacity);
         for (int i = 0; i < buffers.length; ++i) {
-            Object newBuffer = Array.newInstance(archetype.get(i).getType(), newCapacity);
+            Object newBuffer = Array.newInstance(archetype.get(i).type, newCapacity);
             System.arraycopy(buffers[i], 0, newBuffer, 0, count);
             buffers[i] = newBuffer;
         }
@@ -318,150 +364,86 @@ final class EntityChunk {
         handles[toIndex] = handles[fromIndex];
     }
 
-    public boolean isFull() {
-        return count == handles.length;
-    }
+    public boolean isFull() { return count == handles.length; }
+    public int size() { return count; }
+    public int capacity() { return handles.length; }
 
-    public int size() {
-        return count;
-    }
+    public long getHandle(int i) { return handles[i]; }
 
-    public EntityProxy get(int i) {
-        return new EntityProxy(handles[i], this, i);
-    }
-
-    public byte[] getByteBuffer(ComponentType c) {
-        if (c.getType() != byte.class) {
-            throw new RuntimeException("wrong type");
-        }
-        return (byte[]) buffers[archetype.indexOf(c)];
-    }
-
-    public short[] getShortBuffer(ComponentType c) {
-        if (c.getType() != short.class) {
-            throw new RuntimeException("wrong type");
-        }
-        return (short[]) buffers[archetype.indexOf(c)];
-    }
-
-    public int[] getIntBuffer(ComponentType c) {
-        if (c.getType() != int.class) {
-            throw new RuntimeException("wrong type");
-        }
-        return (int[]) buffers[archetype.indexOf(c)];
-    }
-
-    public long[] getLongBuffer(ComponentType c) {
-        if (c.getType() != long.class) {
-            throw new RuntimeException("wrong type");
-        }
-        return (long[]) buffers[archetype.indexOf(c)];
-    }
-
-    public float[] getFloatBuffer(ComponentType c) {
-        if (c.getType() != float.class) {
-            throw new RuntimeException("wrong type");
-        }
-        return (float[]) buffers[archetype.indexOf(c)];
-    }
-
-    public double[] getDoubleBuffer(ComponentType c) {
-        if (c.getType() != double.class) {
-            throw new RuntimeException("wrong type");
-        }
-        return (double[]) buffers[archetype.indexOf(c)];
-    }
-
-    public String[] getStringBuffer(ComponentType c) {
-        if (c.getType() != String.class) {
-            throw new RuntimeException("wrong type");
-        }
-        return (String[]) buffers[archetype.indexOf(c)];
-    }
+    public byte[] get(ByteComponent c) { return (byte[]) buffers[archetype.indexOf(c)]; }
+    public short[] get(ShortComponent c) { return (short[]) buffers[archetype.indexOf(c)]; }
+    public int[] get(IntComponent c) { return (int[]) buffers[archetype.indexOf(c)]; }
+    public long[] get(LongComponent c) { return (long[]) buffers[archetype.indexOf(c)]; }
+    public float[] get(FloatComponent c) { return (float[]) buffers[archetype.indexOf(c)]; }
+    public double[] get(DoubleComponent c) { return (double[]) buffers[archetype.indexOf(c)]; }
+    @SuppressWarnings("unchecked")
+    public<T> T[] get(Component<T> c) { return (T[]) buffers[archetype.indexOf(c)]; }
 }
 
 final class EntityProxy {
-    public final long handle;
-    private final EntityChunk chunk;
-    private final int index;
+    long handle;
+    EntityChunk chunk;
+    int index;
 
-    EntityProxy(long handle, EntityChunk chunk, int index) {
-        this.handle = handle;
+    public void setTarget(EntityChunk chunk, int index) {
+        handle = chunk.handles[index];
         this.chunk = chunk;
         this.index = index;
     }
 
-    public byte getByte(ComponentType c) {
-        return chunk.getByteBuffer(c)[index];
-    }
-    public short getShort(ComponentType c) {
-        return chunk.getShortBuffer(c)[index];
-    }
-    public int getInt(ComponentType c) {
-        return chunk.getIntBuffer(c)[index];
-    }
-    public long getLong(ComponentType c) {
-        return chunk.getLongBuffer(c)[index];
-    }
-    public float getFloat(ComponentType c) {
-        return chunk.getFloatBuffer(c)[index];
-    }
-    public double getDouble(ComponentType c) {
-        return chunk.getDoubleBuffer(c)[index];
-    }
-    public String getString(ComponentType c) {
-        return chunk.getStringBuffer(c)[index];
+    public long getHandle() {
+        return handle;
     }
 
-    public void setByte(ComponentType c, byte value) {
-        chunk.getByteBuffer(c)[index] = value;
-    }
-    public void setShort(ComponentType c, short value) {
-        chunk.getShortBuffer(c)[index] = value;
-    }
-    public void setInt(ComponentType c, int value) {
-        chunk.getIntBuffer(c)[index] = value;
-    }
-    public void setLong(ComponentType c, long value) {
-        chunk.getLongBuffer(c)[index] = value;
-    }
-    public void setFloat(ComponentType c, float value) {
-        chunk.getFloatBuffer(c)[index] = value;
-    }
-    public void setDouble(ComponentType c, double value) {
-        chunk.getDoubleBuffer(c)[index] = value;
-    }
-    public void setString(ComponentType c, String value) {
-        chunk.getStringBuffer(c)[index] = value;
-    }
+    public byte get(ByteComponent c) { return chunk.get(c)[index]; }
+    public short get(ShortComponent c) { return chunk.get(c)[index]; }
+    public int get(IntComponent c) { return chunk.get(c)[index]; }
+    public long get(LongComponent c) { return chunk.get(c)[index]; }
+    public float get(FloatComponent c) { return chunk.get(c)[index]; }
+    public double get(DoubleComponent c) { return chunk.get(c)[index]; }
+    public<T> T get(Component<T> c) { return chunk.get(c)[index]; }
+
+    public void set(ByteComponent c, byte value) { chunk.get(c)[index] = value; }
+    public void set(ShortComponent c, short value) { chunk.get(c)[index] = value; }
+    public void set(IntComponent c, int value) { chunk.get(c)[index] = value; }
+    public void set(LongComponent c, long value) { chunk.get(c)[index] = value; }
+    public void set(FloatComponent c, float value) { chunk.get(c)[index] = value; }
+    public void set(DoubleComponent c, double value) { chunk.get(c)[index] = value; }
+    public<T> void set(Component<T> c, T value) { chunk.get(c)[index] = value; }
 }
 
 final class EntityCollection {
-    private final ArchetypePool[] poolsByArchetype = new ArchetypePool[Archetype.MAX_ID_COUNT];
     private final ArrayList<ArchetypePool> pools = new ArrayList<>();
+    private ArchetypePool[] poolsByArchetype = new ArchetypePool[128];
 
     private EntityChunk[] chunks = new EntityChunk[128];
     private int chunkCount;
 
-    private long[] entities = new long[4096];
+    private long[] entities = new long[1024];
     private int entitiesCount;
-    private int[] entitiesFreelist = new int[512];
+    private int[] entitiesFreelist = new int[256];
     private int entitiesFreelistCount;
 
-    public EntityProxy getEntity(long handle) {
+    public boolean getEntity(long handle, EntityProxy result) {
         long slotInfo = entities[getHandleEntityIndex(handle)];
         if (getHandleGeneration(handle) == getSlotGeneration(slotInfo)) {
             EntityChunk chunk = chunks[getSlotChunkId(slotInfo)];
             int chunkIndex = getSlotChunkIndex(slotInfo);
             if (chunk.handles[chunkIndex] == handle) {
-                return new EntityProxy(handle, chunk, chunkIndex);
+                result.handle = handle;
+                result.chunk = chunk;
+                result.index = chunkIndex;
+                return true;
             }
             throw new RuntimeException("inconsistent state");
         }
-        return null;
+        return false;
     }
 
-    ArchetypePool getPool(Archetype archetype) {
+    private ArchetypePool getPool(Archetype archetype) {
+        while (archetype.id >= poolsByArchetype.length) {
+            poolsByArchetype = Arrays.copyOf(poolsByArchetype, poolsByArchetype.length * 2);
+        }
         ArchetypePool pool = poolsByArchetype[archetype.id];
         if (pool == null) {
             pool = new ArchetypePool(archetype);
@@ -471,7 +453,7 @@ final class EntityCollection {
         return pool;
     }
 
-    EntityChunk getNonEmptyChunk(Archetype archetype) {
+    private EntityChunk getNonEmptyChunk(Archetype archetype) {
         ArchetypePool pool = getPool(archetype);
         if (pool.notFullChunks.size() > 0) {
             return pool.notFullChunks.get(0);
@@ -487,7 +469,7 @@ final class EntityCollection {
         return chunk;
     }
 
-    public EntityProxy newEntity(Archetype archetype) {
+    public long newEntity(Archetype archetype, EntityProxy result) {
         EntityChunk chunk = getNonEmptyChunk(archetype);
         int chunkIndex = chunk.count++;
         if (chunk.isFull()) {
@@ -510,7 +492,17 @@ final class EntityCollection {
 
         long handle = makeHandle(entityIndex, generation);
         chunk.handles[chunkIndex] = handle;
-        return new EntityProxy(handle, chunk, chunkIndex);
+
+        if (result != null) {
+            result.handle = handle;
+            result.chunk = chunk;
+            result.index = chunkIndex;
+        }
+        return handle;
+    }
+
+    public long newEntity(Archetype archetype) {
+        return newEntity(archetype, null);
     }
 
     public boolean freeEntity(long handle) {
@@ -681,40 +673,7 @@ final class EntityCollection {
 
 
 
-
-enum Component implements ComponentType {
-    OBJECT_ID(long.class),
-    REMOTE_ID1(long.class),
-    REMOTE_ID2(long.class),
-    CTIME(double.class),
-    MTIME(double.class),
-    SIZE(long.class),
-    CHECKSUM1(long.class),
-    CHECKSUM2(long.class),
-    CHECKSUM3(int.class);
-
-    private final Class type;
-
-    private Component() {
-        this.type = null;
-    }
-
-    private Component(Class type) {
-        this.type = type;
-    }
-
-    @Override
-    public int getId() {
-        return ordinal();
-    }
-
-    @Override
-    public Class getType() {
-        return type;
-    }
-}
-
-class FileObject {
+final class FileObject {
     public final long objectId;
     public final long size;
     public final long remoteId1;
@@ -735,25 +694,35 @@ class FileObject {
 }
 
 public class Main {
+    static final LongComponent OBJECT_ID = new LongComponent(0);
+    static final LongComponent REMOTE_ID1 = new LongComponent(1);
+    static final LongComponent REMOTE_ID2 = new LongComponent(2);
+    static final DoubleComponent CTIME = new DoubleComponent(3);
+    static final DoubleComponent MTIME = new DoubleComponent(4);
+    static final LongComponent SIZE = new LongComponent(5);
+    static final LongComponent CHECKSUM1 = new LongComponent(6);
+    static final LongComponent CHECKSUM2 = new LongComponent(7);
+    static final IntComponent CHECKSUM3 = new IntComponent(8);
+
     public static void main(String[] args) {
         Archetype fileType = Archetype.of(
-            Component.OBJECT_ID,
-            Component.SIZE,
-            Component.REMOTE_ID1,
-            Component.REMOTE_ID2,
-            Component.CHECKSUM1,
-            Component.CHECKSUM2,
-            Component.CHECKSUM3
+            OBJECT_ID,
+            SIZE,
+            REMOTE_ID1,
+            REMOTE_ID2,
+            CHECKSUM1,
+            CHECKSUM2,
+            CHECKSUM3
         );
         
-        Archetype a = Archetype.of(Component.OBJECT_ID);
+        Archetype a = Archetype.of(OBJECT_ID);
         Archetype b = a.with(
-            Component.SIZE,
-            Component.REMOTE_ID1,
-            Component.REMOTE_ID2,
-            Component.CHECKSUM1,
-            Component.CHECKSUM2,
-            Component.CHECKSUM3
+            SIZE,
+            REMOTE_ID1,
+            REMOTE_ID2,
+            CHECKSUM1,
+            CHECKSUM2,
+            CHECKSUM3
         );
 
         System.out.println(fileType == a);
@@ -762,38 +731,44 @@ public class Main {
         {
             EntityCollection collection = new EntityCollection();
     
-            EntityProxy file1 = collection.newEntity(fileType);
-            file1.setLong(Component.OBJECT_ID, 1);
-            file1.setLong(Component.SIZE, 123);
+            EntityProxy file1 = new EntityProxy();
+            collection.newEntity(fileType, file1);
+            file1.set(OBJECT_ID, 1);
+            file1.set(SIZE, 123);
     
-            EntityProxy file2 = collection.newEntity(fileType);
-            file2.setLong(Component.OBJECT_ID, 2);
-            file2.setLong(Component.SIZE, 666);
+            EntityProxy file2 = new EntityProxy();
+            collection.newEntity(fileType, file2);
+            file2.set(OBJECT_ID, 2);
+            file2.set(SIZE, 666);
     
-            EntityProxy file3 = collection.newEntity(fileType);
-            file3.setLong(Component.OBJECT_ID, 3);
-            file3.setLong(Component.SIZE, 667);
+            EntityProxy file3 = new EntityProxy();
+            collection.newEntity(fileType, file3);
+            file3.set(OBJECT_ID, 3);
+            file3.set(SIZE, 667);
     
-            System.out.println(collection.getEntity(file2.handle));
+            EntityProxy temp = new EntityProxy();
+            System.out.println(collection.getEntity(file2.handle, temp));
             collection.freeEntity(file2.handle);
-            System.out.println(collection.getEntity(file2.handle));
+            System.out.println(collection.getEntity(file2.handle, temp));
     
-            EntityProxy file4 = collection.newEntity(fileType);
-            file4.setLong(Component.OBJECT_ID, 4);
-            file4.setLong(Component.SIZE, 668);
+            EntityProxy file4 = new EntityProxy();
+            collection.newEntity(fileType, file4);
+            file4.set(OBJECT_ID, 4);
+            file4.set(SIZE, 668);
     
-            EntityProxy file5 = collection.newEntity(fileType);
-            file5.setLong(Component.OBJECT_ID, 5);
-            file5.setLong(Component.SIZE, 669);
+            EntityProxy file5 = new EntityProxy();
+            collection.newEntity(fileType, file5);
+            file5.set(OBJECT_ID, 5);
+            file5.set(SIZE, 669);
 
-            for (EntityChunk chunk : collection.chunksMatching(Archetype.of(Component.OBJECT_ID))) {
-                collection.addComponents(chunk, Component.CTIME);
+            for (EntityChunk chunk : collection.chunksMatching(Archetype.of(OBJECT_ID))) {
+                collection.addComponents(chunk, CTIME);
             }
 
-            for (EntityChunk chunk : collection.chunksMatching(Archetype.of(Component.CTIME))) {
+            for (EntityChunk chunk : collection.chunksMatching(Archetype.of(CTIME))) {
                 int count = chunk.size();
-                long[] objectIds = chunk.getLongBuffer(Component.OBJECT_ID);
-                double[] ctimes = chunk.getDoubleBuffer(Component.CTIME);
+                long[] objectIds = chunk.get(OBJECT_ID);
+                double[] ctimes = chunk.get(CTIME);
                 for (int i = 0; i < count; ++i) {
                     long id = objectIds[i];
                     System.out.println("id: " + id + ", entityIndex: " + (int) chunk.handles[i] + ", ctime: " + ctimes[i]);
@@ -805,10 +780,11 @@ public class Main {
 
         long startCreate2 = System.currentTimeMillis();
         EntityCollection collection = new EntityCollection();
+        EntityProxy file = new EntityProxy();
         for (int i = 0; i < N; ++i) {
-            EntityProxy file = collection.newEntity(fileType);
-            file.setLong(Component.OBJECT_ID, i);
-            file.setLong(Component.SIZE, i);
+            collection.newEntity(fileType, file);
+            file.set(OBJECT_ID, i);
+            file.set(SIZE, i);
         }
         long endCreate2 = System.currentTimeMillis();
         System.out.println("Create2: " + (endCreate2 - startCreate2));
@@ -818,7 +794,7 @@ public class Main {
         long sum2 = 0;
         for (EntityChunk chunk : collection.chunksMatching(fileType)) {
             int count = chunk.size();
-            long[] sizes = chunk.getLongBuffer(Component.SIZE);
+            long[] sizes = chunk.get(SIZE);
             for (int i = 0; i < count; ++i) {
                 sum2 += sizes[i];
             }
