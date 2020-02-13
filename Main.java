@@ -1,3 +1,4 @@
+import java.util.concurrent.atomic.AtomicInteger;
 import java.lang.reflect.Array;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -34,6 +35,16 @@ abstract class ComponentType {
                 throw new RuntimeException("ComponentType ID already registered: " + id);
             }
             registry.put(id, this);
+        }
+    }
+
+    public static ComponentType getComponentType(int id) {
+        synchronized (registry) {
+            ComponentType type = registry.get(id);
+            if (type == null) {
+                throw new RuntimeException("ComponentType ID not registered: " + id);
+            }
+            return type;
         }
     }
 }
@@ -99,8 +110,8 @@ final class Util {
 final class Archetype implements Iterable<ComponentType> {
     public final int id;
     public final Key key;
+    public final long tag;
 
-    private final long tag;
     private final long flags0, flags1, flags2, flags3;
     private final ComponentType[] components;
     private final byte[] indexes;
@@ -193,6 +204,9 @@ final class Archetype implements Iterable<ComponentType> {
     }
 
     public Archetype with(long tag) {
+        if (tag == this.tag) {
+            return this;
+        }
         return getOrCreate(new Key(tag, flags0, flags1, flags2, flags3), components);
     }
 
@@ -253,13 +267,8 @@ final class Archetype implements Iterable<ComponentType> {
             && (flags3 & t.flags3) == t.flags3;
     }
 
-    public int size() {
-        return components.length;
-    }
-
-    public ComponentType get(int i) {
-        return components[i];
-    }
+    public int size() { return components.length; }
+    public ComponentType get(int i) { return components[i]; }
 
     @Override
     public Iterator<ComponentType> iterator() {
@@ -317,56 +326,138 @@ final class Archetype implements Iterable<ComponentType> {
 }
 
 
+
 final class EntityChunk {
     public final int id;
 
     Archetype archetype;
-    Object[] buffers;
     int capacity;
-    int count;
+    int maxCapacity;
+    int size;
+    Object[] buffers;
+    AtomicInteger[] refcounts;
 
-    EntityChunk(int id, Archetype archetype, int capacity) {
+    EntityChunk(int id, Archetype archetype, int capacity, int maxCapacity) {
         this.id = id;
         this.archetype = archetype;
+        this.capacity = capacity;
+        this.maxCapacity = maxCapacity;
         int bufferCount = archetype.size();
         buffers = new Object[bufferCount + 1];
+        refcounts = new AtomicInteger[bufferCount + 1];
         for (int i = 0; i < bufferCount; ++i) {
             buffers[i] = Array.newInstance(archetype.get(i).type, capacity);
+            refcounts[i] = new AtomicInteger(1);
         }
-        this.capacity = capacity;
+        refcounts[bufferCount] = new AtomicInteger(0);
+    }
+
+    private EntityChunk(EntityChunk chunk) {
+        id = chunk.id;
+        archetype = chunk.archetype;
+        capacity = chunk.capacity;
+        maxCapacity = chunk.maxCapacity;
+        size = chunk.size;
+        buffers = Arrays.copyOf(chunk.buffers, chunk.buffers.length);
+        refcounts = Arrays.copyOf(chunk.refcounts, chunk.refcounts.length);
+        int bufferCount = archetype.size();
+        for (int i = 0; i < bufferCount; ++i) {
+            refcounts[i].incrementAndGet();
+        }
+    }
+
+    private EntityChunk(EntityChunk chunk, Archetype projection) {
+        if (!chunk.archetype.isSupertype(projection)) {
+            throw new RuntimeException("illegal projection");
+        }
+        id = chunk.id;
+        archetype = projection;
+        capacity = chunk.capacity;
+        maxCapacity = chunk.maxCapacity;
+        size = chunk.size;
+        int bufferCount = projection.size();
+        buffers = new Object[bufferCount + 1];
+        refcounts = new AtomicInteger[bufferCount];
+        for (int i = 0; i < bufferCount; ++i) {
+            ComponentType c = projection.get(i);
+            int j = chunk.archetype.indexOf(c);
+            buffers[i] = chunk.buffers[j];
+            AtomicInteger refcount = chunk.refcounts[j];
+            refcount.incrementAndGet();
+            refcounts[i] = refcount;
+        }
     }
 
     public Archetype getArchetype() { return archetype; }
 
     void grow() {
-        int newCapacity = capacity * 2;
+        int newCapacity = Math.min(maxCapacity, capacity * 2);
         int bufferCount = archetype.size();
         for (int i = 0; i < bufferCount; ++i) {
             Object newBuffer = Array.newInstance(archetype.get(i).type, newCapacity);
-            System.arraycopy(buffers[i], 0, newBuffer, 0, count);
+            System.arraycopy(buffers[i], 0, newBuffer, 0, size);
             buffers[i] = newBuffer;
+            refcounts[i] = new AtomicInteger(1);
         }
     }
 
     void copyEntity(int fromIndex, int toIndex) {
         int bufferCount = archetype.size();
         for (int i = 0; i < bufferCount; ++i) {
-            System.arraycopy(buffers[i], fromIndex, buffers[i], toIndex, 1);
+            Object buffer = getBufferForWriting(i);
+            System.arraycopy(buffer, fromIndex, buffer, toIndex, 1);
         }
     }
 
-    public boolean isFull() { return count == capacity; }
-    public int size() { return count; }
+    public EntityChunk copy() { return new EntityChunk(this); }
+    public EntityChunk copyProjection(Archetype projection) { return new EntityChunk(this, projection); }
+    public void destroy() { // call destroy() on copied chunks when done with them (enables avoidance of COW copying)
+        int bufferCount = archetype.size();
+        for (int i = 0; i < bufferCount; ++i) {
+            refcounts[i].decrementAndGet();
+        }
+        archetype = null;
+        capacity = 0;
+        maxCapacity = 0;
+        size = 0;
+        buffers = null;
+        refcounts = null;
+    }
+
+    public boolean isFull() { return size >= maxCapacity; }
+    public int size() { return size; }
     public int capacity() { return capacity; }
 
-    public byte[] get(ByteComponent c) { return (byte[]) buffers[archetype.indexOf(c)]; }
-    public short[] get(ShortComponent c) { return (short[]) buffers[archetype.indexOf(c)]; }
-    public int[] get(IntComponent c) { return (int[]) buffers[archetype.indexOf(c)]; }
-    public long[] get(LongComponent c) { return (long[]) buffers[archetype.indexOf(c)]; }
-    public float[] get(FloatComponent c) { return (float[]) buffers[archetype.indexOf(c)]; }
-    public double[] get(DoubleComponent c) { return (double[]) buffers[archetype.indexOf(c)]; }
+    private Object getBufferForWriting(int i) {
+        AtomicInteger refcount = refcounts[i];
+        if (refcount.get() <= 1) {
+            return buffers[i];
+        }
+        Object newBuffer =  Array.newInstance(archetype.get(i).type, capacity);
+        System.arraycopy(buffers[i], 0, newBuffer, 0, size);
+        refcount.decrementAndGet();
+        buffers[i] = newBuffer;
+        refcounts[i] = new AtomicInteger(1);
+        return newBuffer;
+    }
+
+    public byte[] write(ByteComponent c) { return (byte[]) getBufferForWriting(archetype.indexOf(c)); }
+    public short[] write(ShortComponent c) { return (short[]) getBufferForWriting(archetype.indexOf(c)); }
+    public int[] write(IntComponent c) { return (int[]) getBufferForWriting(archetype.indexOf(c)); }
+    public long[] write(LongComponent c) { return (long[]) getBufferForWriting(archetype.indexOf(c)); }
+    public float[] write(FloatComponent c) { return (float[]) getBufferForWriting(archetype.indexOf(c)); }
+    public double[] write(DoubleComponent c) { return (double[]) getBufferForWriting(archetype.indexOf(c)); }
     @SuppressWarnings("unchecked")
-    public<T> T[] get(Component<T> c) { return (T[]) buffers[archetype.indexOf(c)]; }
+    public<T> T[] write(Component<T> c) { return (T[]) getBufferForWriting(archetype.indexOf(c)); }
+
+    public byte[] read(ByteComponent c) { return (byte[]) buffers[archetype.indexOf(c)]; }
+    public short[] read(ShortComponent c) { return (short[]) buffers[archetype.indexOf(c)]; }
+    public int[] read(IntComponent c) { return (int[]) buffers[archetype.indexOf(c)]; }
+    public long[] read(LongComponent c) { return (long[]) buffers[archetype.indexOf(c)]; }
+    public float[] read(FloatComponent c) { return (float[]) buffers[archetype.indexOf(c)]; }
+    public double[] read(DoubleComponent c) { return (double[]) buffers[archetype.indexOf(c)]; }
+    @SuppressWarnings("unchecked")
+    public<T> T[] read(Component<T> c) { return (T[]) buffers[archetype.indexOf(c)]; }
 }
 
 final class EntityProxy {
@@ -378,36 +469,54 @@ final class EntityProxy {
         this.index = index;
     }
 
-    public byte get(ByteComponent c) { return chunk.get(c)[index]; }
-    public short get(ShortComponent c) { return chunk.get(c)[index]; }
-    public int get(IntComponent c) { return chunk.get(c)[index]; }
-    public long get(LongComponent c) { return chunk.get(c)[index]; }
-    public float get(FloatComponent c) { return chunk.get(c)[index]; }
-    public double get(DoubleComponent c) { return chunk.get(c)[index]; }
-    public<T> T get(Component<T> c) { return chunk.get(c)[index]; }
+    public void set(ByteComponent c, byte value) { chunk.write(c)[index] = value; }
+    public void set(ShortComponent c, short value) { chunk.write(c)[index] = value; }
+    public void set(IntComponent c, int value) { chunk.write(c)[index] = value; }
+    public void set(LongComponent c, long value) { chunk.write(c)[index] = value; }
+    public void set(FloatComponent c, float value) { chunk.write(c)[index] = value; }
+    public void set(DoubleComponent c, double value) { chunk.write(c)[index] = value; }
+    public<T> void set(Component<T> c, T value) { chunk.write(c)[index] = value; }
 
-    public void set(ByteComponent c, byte value) { chunk.get(c)[index] = value; }
-    public void set(ShortComponent c, short value) { chunk.get(c)[index] = value; }
-    public void set(IntComponent c, int value) { chunk.get(c)[index] = value; }
-    public void set(LongComponent c, long value) { chunk.get(c)[index] = value; }
-    public void set(FloatComponent c, float value) { chunk.get(c)[index] = value; }
-    public void set(DoubleComponent c, double value) { chunk.get(c)[index] = value; }
-    public<T> void set(Component<T> c, T value) { chunk.get(c)[index] = value; }
+    public byte get(ByteComponent c) { return chunk.read(c)[index]; }
+    public short get(ShortComponent c) { return chunk.read(c)[index]; }
+    public int get(IntComponent c) { return chunk.read(c)[index]; }
+    public long get(LongComponent c) { return chunk.read(c)[index]; }
+    public float get(FloatComponent c) { return chunk.read(c)[index]; }
+    public double get(DoubleComponent c) { return chunk.read(c)[index]; }
+    public<T> T get(Component<T> c) { return chunk.read(c)[index]; }
+}
+
+final class ArchetypeConfig {
+    public int initialChunkCapacity = 1024;
+    public int maxChunkCapacity = 1024;
+}
+
+interface ConfigDelegate {
+    void configure(Archetype archetype, ArchetypeConfig config);
 }
 
 final class EntityCollection {
+    private final ConfigDelegate configDelegate;
+
     private final ArrayList<ArchetypePool> pools = new ArrayList<>();
     private ArchetypePool[] poolsByArchetype = new ArchetypePool[128];
 
-    private EntityChunk[] chunks = new EntityChunk[128];
+    private EntityChunk[] chunks = new EntityChunk[64];
     private int chunkCount;
     private int[] chunksFreelist = new int[32];
     private int chunksFreelistCount;
 
-    private long[] entities = new long[1024];
+    private long[] entities = new long[128];
     private int entitiesCount;
-    private int[] entitiesFreelist = new int[256];
+    private int[] entitiesFreelist = new int[32];
     private int entitiesFreelistCount;
+
+    public EntityCollection() {
+        configDelegate = (archetype, config) -> {};
+    }
+    public EntityCollection(ConfigDelegate configDelegate) {
+        this.configDelegate = configDelegate;
+    }
 
     public boolean getEntity(long handle, EntityProxy result) {
         long slotInfo = entities[getHandleEntityIndex(handle)];
@@ -424,7 +533,7 @@ final class EntityCollection {
         }
         ArchetypePool pool = poolsByArchetype[archetype.id];
         if (pool == null) {
-            pool = new ArchetypePool(archetype);
+            pool = new ArchetypePool(archetype, configDelegate);
             poolsByArchetype[archetype.id] = pool;
             pools.add(pool);
         }
@@ -445,23 +554,25 @@ final class EntityCollection {
                 chunks = Arrays.copyOf(chunks, chunks.length * 2);
             }
         }
-        EntityChunk chunk = new EntityChunk(id, archetype, 10000);
+        EntityChunk chunk = new EntityChunk(id, archetype, pool.config.initialChunkCapacity, pool.config.maxChunkCapacity);
         chunks[id] = chunk;
-        pool.allChunks.add(chunk);
-        pool.notFullChunks.add(chunk);
+        pool.addChunk(chunk);
         return chunk;
     }
 
     public long newEntity(Archetype archetype, EntityProxy result) {
         EntityChunk chunk = getNonEmptyChunk(archetype);
-        int chunkIndex = chunk.count++;
+        int chunkIndex = chunk.size++;
         if (chunk.isFull()) {
             poolsByArchetype[archetype.id].onChunkFull(chunk);
+        }
+        if (chunkIndex >= chunk.capacity) {
+            chunk.grow();
         }
         if (result != null) {
             result.setTarget(chunk, chunkIndex);
         }
-        long[] handles = chunk.get(StandardComponents.HANDLE);
+        long[] handles = chunk.write(StandardComponents.HANDLE);
         if (handles != null) {
             long handle = allocHandle(chunk, chunkIndex);
             handles[chunkIndex] = handle;
@@ -484,14 +595,14 @@ final class EntityCollection {
         int chunkId = getSlotChunkId(slotInfo);
         int chunkIndex = getSlotChunkIndex(slotInfo);
         EntityChunk chunk = chunks[chunkId];
-        long[] handles = chunk.get(StandardComponents.HANDLE);
+        long[] handles = chunk.read(StandardComponents.HANDLE);
         if (handles[chunkIndex] != handle) {
             throw new RuntimeException("inconsistent state");
         }
 
-        if (chunkIndex != chunk.count - 1) {
+        if (chunkIndex != chunk.size - 1) {
             // move back last entity, so chunk remains dense
-            chunk.copyEntity(chunk.count - 1, chunkIndex);
+            chunk.copyEntity(chunk.size - 1, chunkIndex);
             long movedHandle = handles[chunkIndex];
             int movedEntityIndex = getHandleEntityIndex(movedHandle);
             long movedSlotInfo = entities[movedEntityIndex];
@@ -502,7 +613,7 @@ final class EntityCollection {
             if (getSlotChunkId(movedSlotInfo) != chunk.id) {
                 throw new RuntimeException("inconsistent state");
             }
-            if (getSlotChunkIndex(movedSlotInfo) != chunk.count - 1) {
+            if (getSlotChunkIndex(movedSlotInfo) != chunk.size - 1) {
                 throw new RuntimeException("inconsistent state");
             }
             entities[movedEntityIndex] = makeSlotInfo(chunk.id, chunkIndex, movedGeneration);
@@ -511,7 +622,7 @@ final class EntityCollection {
         if (chunk.isFull()) {
             poolsByArchetype[chunk.archetype.id].onChunkNotFull(chunk);
         }
-        --chunk.count;
+        --chunk.size;
 
         deallocHandle(entityIndex, generation);
         return true;
@@ -529,7 +640,7 @@ final class EntityCollection {
             }
         }
         long prevSlotInfo = entities[entityIndex];
-        int generation = getSlotGeneration(prevSlotInfo);
+        int generation = incGeneration(getSlotGeneration(prevSlotInfo));
         entities[entityIndex] = makeSlotInfo(chunk.id, chunkIndex, generation);
         return makeHandle(entityIndex, generation);
     }
@@ -554,9 +665,9 @@ final class EntityCollection {
         }
         chunksFreelist[chunksFreelistCount++] = chunk.id;
 
-        long[] handles = chunk.get(StandardComponents.HANDLE);
+        long[] handles = chunk.read(StandardComponents.HANDLE);
         if (handles != null) {
-            for (int i = 0; i < chunk.count; ++i) {
+            for (int i = 0; i < chunk.size; ++i) {
                 deallocHandle(handles[i]);
             }
         }
@@ -568,29 +679,34 @@ final class EntityCollection {
             return;
         }
 
-        long[] handles = chunk.get(StandardComponents.HANDLE);
+        long[] handles = chunk.read(StandardComponents.HANDLE);
 
         int bufferCount = newArchetype.size();
         Object[] newBuffers = new Object[bufferCount + 1];
+        AtomicInteger[] newRefcounts = new AtomicInteger[bufferCount];
         for (int i = 0; i < bufferCount; ++i) {
             ComponentType c = newArchetype.get(i);
             if (archetype.hasComponent(c)) {
-                newBuffers[i] = chunk.buffers[archetype.indexOf(c)];
+                int j = archetype.indexOf(c);
+                newBuffers[i] = chunk.buffers[j];
+                newRefcounts[i] = chunk.refcounts[j];
             } else {
                 newBuffers[i] = Array.newInstance(c.type, chunk.capacity);
+                newRefcounts[i] = new AtomicInteger(1);
             }
         }
         
         chunk.archetype = newArchetype;
         chunk.buffers = newBuffers;
+        chunk.refcounts = newRefcounts;
 
-        long[] newHandles = chunk.get(StandardComponents.HANDLE);
+        long[] newHandles = chunk.write(StandardComponents.HANDLE);
         if (newHandles != null && handles == null) {
-            for (int i = 0; i < chunk.count; ++i) {
+            for (int i = 0; i < chunk.size; ++i) {
                 newHandles[i] = allocHandle(chunk, i);
             }
         } else if (newHandles == null && handles != null) {
-            for (int i = 0; i < chunk.count; ++i) {
+            for (int i = 0; i < chunk.size; ++i) {
                 deallocHandle(handles[i]);
             }
         }
@@ -608,10 +724,7 @@ final class EntityCollection {
     }
 
     private static int incGeneration(int generation) {
-        if (generation == 32767) {
-            return 0;
-        }
-        return generation + 1;
+        return (generation + 1) & 32767;
     }
 
     private static long makeHandle(int entityIndex, int generation) {
@@ -655,24 +768,27 @@ final class EntityCollection {
         }
         return result;
     }
-    public ArrayList<EntityChunk> chunksMatching(Archetype archetype) {
+    public ArrayList<EntityChunk> findChunksMatching(Archetype archetype) {
         return findChunks(a -> a.isSupertype(archetype));
     }
-    public ArrayList<EntityChunk> chunksMatchingExactly(Archetype archetype) {
+    public ArrayList<EntityChunk> findChunksMatchingExactly(Archetype archetype) {
         return findChunks(a -> a == archetype);
     }
 
     private static final class ArchetypePool {
         final Archetype archetype;
+        final ArchetypeConfig config = new ArchetypeConfig();
         final ArrayList<EntityChunk> allChunks = new ArrayList<>();
         final ArrayList<EntityChunk> fullChunks = new ArrayList<>();
         final ArrayList<EntityChunk> notFullChunks = new ArrayList<>();
 
-        ArchetypePool(Archetype archetype) {
+        ArchetypePool(Archetype archetype, ConfigDelegate configDelegate) {
             this.archetype = archetype;
+            configDelegate.configure(archetype, config);
         }
 
         void addChunk(EntityChunk chunk) {
+            chunk.maxCapacity = Math.max(chunk.capacity, config.maxChunkCapacity);
             allChunks.add(chunk);
             if (chunk.isFull()) {
                 fullChunks.add(chunk);
@@ -680,7 +796,6 @@ final class EntityCollection {
                 notFullChunks.add(chunk);
             }
         }
-
         void removeChunk(EntityChunk chunk) {
             allChunks.remove(chunk);
             if (chunk.isFull()) {
@@ -689,12 +804,10 @@ final class EntityCollection {
                 notFullChunks.remove(chunk);
             }
         }
-
         void onChunkFull(EntityChunk chunk) {
             notFullChunks.remove(chunk);
             fullChunks.add(chunk);
         }
-
         void onChunkNotFull(EntityChunk chunk) {
             fullChunks.remove(chunk);
             notFullChunks.add(chunk);
@@ -705,25 +818,6 @@ final class EntityCollection {
 
 
 
-final class FileObject {
-    public final long objectId;
-    public final long size;
-    public final long remoteId1;
-    public final long remoteId2;
-    public final long checksum1;
-    public final long checksum2;
-    public final int checksum3;
-
-    FileObject(long objectId, long size) {
-        this.objectId = objectId;
-        this.size = size;
-        remoteId1 = 0;
-        remoteId2 = 0;
-        checksum1 = 0;
-        checksum2 = 0;
-        checksum3 = 0;
-    }
-}
 
 public class Main {
     static final LongComponent HANDLE = StandardComponents.HANDLE;
@@ -737,123 +831,87 @@ public class Main {
     static final LongComponent CHECKSUM1 = new LongComponent(16);
     static final LongComponent CHECKSUM2 = new LongComponent(17);
     static final IntComponent CHECKSUM3 = new IntComponent(18);
+    static final Component<String> ASSET_ID = new Component<>(19, String.class);
+    static final MarkerComponent IS_LOCAL_ASSET = new MarkerComponent(20);
+    static final MarkerComponent IS_TIMELINE_FILE = new MarkerComponent(21);
+    static final Component<String> FILENAME = new Component<>(22, String.class);
+
+    static final Archetype TIMELINE_FILE = Archetype.of(
+        IS_TIMELINE_FILE,
+        HANDLE,
+        REMOTE_ID1,
+        REMOTE_ID2,
+        FILENAME,
+        SIZE,
+        CTIME,
+        MTIME,
+        CHECKSUM1,
+        CHECKSUM2,
+        CHECKSUM3,
+        ASSET_ID
+    );
+
+    static final Archetype LOCAL_ASSET = Archetype.of(
+        IS_LOCAL_ASSET,
+        ASSET_ID,
+        FILENAME,
+        SIZE,
+        CTIME,
+        MTIME,
+        CHECKSUM1,
+        CHECKSUM2,
+        CHECKSUM3
+    );
+
+    static final ConfigDelegate CONFIG = (archetype, config) -> {
+        if (archetype.tag != 0) {
+            // Tagged archetypes is intended to define groupings.
+            // Simplify things by making sure there is only one chunk per grouping.
+            config.maxChunkCapacity = Integer.MAX_VALUE;
+        }
+    };
+
+    static class Asset {
+        String id;
+        String filename;
+        long size;
+        double ctime;
+        double mtime;
+    }
+
+    private static long timestampTag(double timestamp) {
+        return (long) timestamp / (3600 * 24 * 30);
+    }
 
     public static void main(String[] args) {
-        Archetype fileType = Archetype.of(
-            HANDLE,
-            OBJECT_ID,
-            SIZE,
-            REMOTE_ID1,
-            REMOTE_ID2,
-            CHECKSUM1,
-            CHECKSUM2,
-            CHECKSUM3
-        );
-        
-        Archetype a = Archetype.of(HANDLE, OBJECT_ID);
-        Archetype b = a.with(
-            SIZE,
-            REMOTE_ID1,
-            REMOTE_ID2,
-            CHECKSUM1,
-            CHECKSUM2,
-            CHECKSUM3
-        );
+        EntityCollection collection = new EntityCollection(CONFIG);
 
-        System.out.println(fileType == a);
-        System.out.println(fileType == b);
+        ArrayList<Asset> assets = generateAssets(10000);
 
-        {
-            EntityCollection collection = new EntityCollection();
-    
-            EntityProxy file1 = new EntityProxy();
-            collection.newEntity(fileType, file1);
-            file1.set(OBJECT_ID, 1);
-            file1.set(SIZE, 123);
-    
-            EntityProxy file2 = new EntityProxy();
-            collection.newEntity(fileType, file2);
-            file2.set(OBJECT_ID, 2);
-            file2.set(SIZE, 666);
-    
-            EntityProxy file3 = new EntityProxy();
-            collection.newEntity(fileType, file3);
-            file3.set(OBJECT_ID, 3);
-            file3.set(SIZE, 667);
-    
-            EntityProxy temp = new EntityProxy();
-            System.out.println(collection.getEntity(file2.get(HANDLE), temp));
-            collection.freeEntity(file2.get(HANDLE));
-            System.out.println(collection.getEntity(file2.get(HANDLE), temp));
-    
-            EntityProxy file4 = new EntityProxy();
-            collection.newEntity(fileType, file4);
-            file4.set(OBJECT_ID, 4);
-            file4.set(SIZE, 668);
-    
-            EntityProxy file5 = new EntityProxy();
-            collection.newEntity(fileType, file5);
-            file5.set(OBJECT_ID, 5);
-            file5.set(SIZE, 669);
-
-            for (EntityChunk chunk : collection.chunksMatching(Archetype.of(HANDLE, OBJECT_ID))) {
-                collection.addComponents(chunk, CTIME);
-            }
-
-            for (EntityChunk chunk : collection.chunksMatching(Archetype.of(HANDLE, CTIME))) {
-                int count = chunk.size();
-                long[] handles = chunk.get(HANDLE);
-                long[] objectIds = chunk.get(OBJECT_ID);
-                double[] ctimes = chunk.get(CTIME);
-                for (int i = 0; i < count; ++i) {
-                    long id = objectIds[i];
-                    System.out.println("id: " + id + ", entityIndex: " + (int) handles[i] + ", ctime: " + ctimes[i]);
-                }
-            }
+        EntityProxy entity = new EntityProxy();
+        Archetype archetype = LOCAL_ASSET;
+        for (Asset asset : assets) {
+            archetype = archetype.with(timestampTag(asset.ctime));
+            collection.newEntity(archetype, entity);
+            entity.set(ASSET_ID, asset.id);
+            entity.set(FILENAME, asset.filename);
+            entity.set(SIZE, asset.size);
+            entity.set(CTIME, asset.ctime);
+            entity.set(MTIME, asset.mtime);
         }
+    }
 
-        int N = 30000000;
-
-        long startCreate2 = System.currentTimeMillis();
-        EntityCollection collection = new EntityCollection();
-        EntityProxy file = new EntityProxy();
-        for (int i = 0; i < N; ++i) {
-            collection.newEntity(fileType, file);
-            file.set(OBJECT_ID, i);
-            file.set(SIZE, i);
+    private static ArrayList<Asset> generateAssets(int count) {
+        ArrayList<Asset> result = new ArrayList<>();
+        for (int i = 0; i < count; ++i) {
+            Asset asset = new Asset();
+            asset.id = "" + i;
+            asset.filename = i + ".jpg";
+            asset.size = i + 1000;
+            asset.ctime = 1581369296.0 + i * 3600.0;
+            asset.mtime = asset.ctime;
+            result.add(asset);
         }
-        long endCreate2 = System.currentTimeMillis();
-        System.out.println("Create2: " + (endCreate2 - startCreate2));
-
-        int chunks = 0;
-        long startSum2 = System.currentTimeMillis();
-        long sum2 = 0;
-        for (EntityChunk chunk : collection.chunksMatching(fileType)) {
-            int count = chunk.size();
-            long[] sizes = chunk.get(SIZE);
-            for (int i = 0; i < count; ++i) {
-                sum2 += sizes[i];
-            }
-            ++chunks;
-        }
-        long endSum2 = System.currentTimeMillis();
-        System.out.println("Sum2: " + (endSum2 - startSum2) + " - " + sum2);
-        System.out.println("chunks: " + chunks);
-        
-        long startCreate1 = System.currentTimeMillis();
-        FileObject[] files = new FileObject[N];
-        for (int i = 0; i < N; ++i) {
-            files[i] = new FileObject(i, i);
-        }
-        long endCreate1 = System.currentTimeMillis();
-        System.out.println("Create1: " + (endCreate1 - startCreate1));
-
-        long startSum1 = System.currentTimeMillis();
-        long sum1 = 0;
-        for (int i = 0; i < N; ++i) {
-            sum1 += files[i].size;
-        }
-        long endSum1 = System.currentTimeMillis();
-        System.out.println("Sum1: " + (endSum1 - startSum1) + " - " + sum1);
+        return result;
     }
 }
