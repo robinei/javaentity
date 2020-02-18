@@ -336,6 +336,7 @@ final class EntityChunk {
     int size;
     Object[] buffers;
     AtomicInteger[] refcounts;
+    int[] versions;
 
     EntityChunk(int id, Archetype archetype, int capacity, int maxCapacity) {
         this.id = id;
@@ -345,6 +346,7 @@ final class EntityChunk {
         int bufferCount = archetype.size();
         buffers = new Object[bufferCount + 1];
         refcounts = new AtomicInteger[bufferCount + 1];
+        versions = new int[bufferCount + 1];
         for (int i = 0; i < bufferCount; ++i) {
             buffers[i] = Array.newInstance(archetype.get(i).type, capacity);
             refcounts[i] = new AtomicInteger(1);
@@ -360,6 +362,7 @@ final class EntityChunk {
         size = chunk.size;
         buffers = Arrays.copyOf(chunk.buffers, chunk.buffers.length);
         refcounts = Arrays.copyOf(chunk.refcounts, chunk.refcounts.length);
+        versions = Arrays.copyOf(chunk.versions, chunk.versions.length);
         int bufferCount = archetype.size();
         for (int i = 0; i < bufferCount; ++i) {
             refcounts[i].incrementAndGet();
@@ -377,7 +380,8 @@ final class EntityChunk {
         size = chunk.size;
         int bufferCount = projection.size();
         buffers = new Object[bufferCount + 1];
-        refcounts = new AtomicInteger[bufferCount];
+        refcounts = new AtomicInteger[bufferCount + 1];
+        versions = new int[bufferCount + 1];
         for (int i = 0; i < bufferCount; ++i) {
             ComponentType c = projection.get(i);
             int j = chunk.archetype.indexOf(c);
@@ -385,7 +389,9 @@ final class EntityChunk {
             AtomicInteger refcount = chunk.refcounts[j];
             refcount.incrementAndGet();
             refcounts[i] = refcount;
+            versions[i] = chunk.versions[j];
         }
+        refcounts[bufferCount] = chunk.refcounts[bufferCount];
     }
 
     public Archetype getArchetype() { return archetype; }
@@ -422,6 +428,7 @@ final class EntityChunk {
         size = 0;
         buffers = null;
         refcounts = null;
+        versions = null;
     }
 
     public boolean isFull() { return size >= maxCapacity; }
